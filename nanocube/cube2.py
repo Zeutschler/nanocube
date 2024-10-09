@@ -1,13 +1,13 @@
-# nanocube - Copyright (c)2024, Thomas Zeutschler, MIT license
-from datetime import datetime
 from functools import reduce
+
 import numpy as np
 import pandas as pd
-from pandas.api.types import is_numeric_dtype, is_bool_dtype, is_float_dtype
+from pandas.core.dtypes.common import is_numeric_dtype, is_bool_dtype, is_float_dtype
+import sortednp as snp
 from pyroaring import BitMap
 
 
-class NanoCube:
+class Cube2:
     """
     A super minimalistic (27 lines of code) in-memory OLAP cube implementation for lightning fast point queries
     upon Pandas DataFrames (100x to 1000x times faster than Pandas). By default, all non-numeric columns will be
@@ -62,6 +62,10 @@ class NanoCube:
                     member_bitmaps[member] = BitMap([row])
                 else:
                     member_bitmaps[member].add(row)
+
+            for v in member_bitmaps.keys():
+                member_bitmaps[v] = np.array(member_bitmaps[v].to_array())
+
             self.bitmaps.append(member_bitmaps)
 
     def get(self, *args, **kwargs):
@@ -80,16 +84,20 @@ class NanoCube:
             key = f"{args}-{kwargs}"
             if key in self.cache:
                 return self.cache[key]
-        bitmaps = [(reduce(lambda x, y: x | y, [self.bitmaps[d][m] for m in kwargs[dim]])
+        bitmaps = [(reduce(lambda x, y: snp.merge(x, y, duplicates=snp.MergeDuplicates.DROP), [self.bitmaps[d][m] for m in kwargs[dim]])
                    if (isinstance(kwargs[dim], list) or isinstance(kwargs[dim], tuple)) and not isinstance(kwargs[dim], str)
                    else self.bitmaps[d][kwargs[dim]]) for d, dim in enumerate(self.dimensions.keys()) if dim in kwargs]
-        records = reduce(lambda x, y: x & y, bitmaps) if bitmaps else False
+
+        # sort from shortest to largest size to increase set intersection performance
+        bitmaps = sorted(bitmaps, key=lambda l: len(l))
+
+        records = reduce(lambda x, y: snp.intersect(x, y, duplicates=snp.IntersectDuplicates.DROP), bitmaps) if bitmaps else False
         if len(args) == 0: # return all totals as a dict
-            result = dict([(c, np.nansum(self.values[i][records]).item()) if records else(c, np.nansum(self.values[i]).item()) for c, i in self.measures.items()])
+            result = dict([(c, np.nansum(self.values[i][records]).item()) if len(records) else(c, np.nansum(self.values[i]).item()) for c, i in self.measures.items()])
         elif len(args) == 1: # return total as scalar
-            result = np.nansum(self.values[self.measures[args[0]]][records] if records else self.values[self.measures[args[0]]]).item()
+            result = np.nansum(self.values[self.measures[args[0]]][records] if len(records) else self.values[self.measures[args[0]]]).item()
         else:
-            result = [np.nansum(self.values[self.measures[a]][records] if records else self.values[self.measures[a]]).item() for a in args] # return totals as a list
+            result = [np.nansum(self.values[self.measures[a]][records] if len(records) else self.values[self.measures[a]]).item() for a in args] # return totals as a list
         if self.cache:
             self.cache[key] = result
         return result
